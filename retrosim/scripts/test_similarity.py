@@ -12,7 +12,7 @@ import numpy as np
 from tqdm import tqdm
 import json
 import sys
-
+sys.path.append('../../')
 from retrosim.utils.generate_retro_templates import process_an_example
 from retrosim.data.get_data import get_data_df, split_data_df
 
@@ -24,12 +24,13 @@ from rdchiral.main import rdchiralRun, rdchiralReaction, rdchiralReactants
 import os
 
 SCRIPT_ROOT = os.path.dirname(__file__)
-PROJ_ROOT = os.path.dirname(SCRIPT_ROOT)
+PROJ_ROOT = '../'
+OUT = 'out_all'
 
 ############### DEFINITIONS FOR VALIDATION SEARCH ########################
-all_getfp_labels = ['Morgan2noFeat', 'Morgan3noFeat', 'Morgan2Feat', 'Morgan3Feat']
-all_similarity_labels = ['Tanimoto', 'Dice', 'TverskyA', 'TverskyB',]
-all_dataset = ['val']
+# all_getfp_labels = ['Morgan2noFeat', 'Morgan3noFeat', 'Morgan2Feat', 'Morgan3Feat']
+# all_similarity_labels = ['Tanimoto', 'Dice', 'TverskyA', 'TverskyB',]
+# all_dataset = ['val']
 
 ############### DEFINITIONS FOR FINAL EVALUATION #########################
 all_getfp_labels = ['Morgan2Feat']
@@ -50,6 +51,66 @@ def ranks_to_acc(found_at_rank, fid=None):
         accs.append(sum([r <= n for r in found_at_rank]) / tot)
         fprint('{:>8} \t {:>8}'.format(n, accs[-1]))
     return accs
+
+### Define function to process one example based on index, ix
+def do_one_rdchiral(ix, debug=False):
+    jx_cache = {}
+    ex = Chem.MolFromSmiles(datasub_val['prod_smiles'][ix])
+    rct = rdchiralReactants(datasub_val['prod_smiles'][ix])
+    fp = datasub_val['prod_fp'][ix]
+    
+    sims = similarity_metric(fp, [fp_ for fp_ in datasub['prod_fp']])
+    js = np.argsort(sims)[::-1]
+
+    prec_goal = Chem.MolFromSmiles(datasub_val['rxn_smiles'][ix].split('>')[0])
+    [a.ClearProp('molAtomMapNumber') for a in prec_goal.GetAtoms()]
+    prec_goal = Chem.MolToSmiles(prec_goal, True)
+    # Sometimes stereochem takes another canonicalization...
+    prec_goal = Chem.MolToSmiles(Chem.MolFromSmiles(prec_goal), True)
+    
+    # Get probability of precursors
+    probs = {}
+    
+    for j in js[:100]: # limit to 100 for speed
+        jx = datasub.index[j]
+        
+        if jx in jx_cache:
+            (rxn, template, rcts_ref_fp) = jx_cache[jx]
+        else:
+            retro_canonical = process_an_example(datasub['rxn_smiles'][jx], super_general=True)
+            if retro_canonical is None:
+                continue
+            template = '(' + retro_canonical.replace('>>', ')>>')
+            rcts_ref_fp = getfp(datasub['rxn_smiles'][jx].split('>')[0])
+            rxn = rdchiralReaction(template)
+            jx_cache[jx] = (rxn, template, rcts_ref_fp)
+        try:
+            outcomes = rdchiralRun(rxn, rct, combine_enantiomers=False)
+        except Exception as e:
+            print(template)
+            print(datasub_val['rxn_smiles'][ix])
+            raise(e)
+            outcomes = []
+        
+        for precursors in outcomes:
+            precursors_fp = getfp(precursors)
+            precursors_sim = similarity_metric(precursors_fp, [rcts_ref_fp])[0]
+            if precursors in probs:
+                probs[precursors] = max(probs[precursors], precursors_sim * sims[j])
+            else:
+                probs[precursors] = precursors_sim * sims[j]
+    
+    testlimit = 50
+    found_rank = 9999
+    for r, (prec, prob) in enumerate(sorted(probs.iteritems(), key=lambda x:x[1], reverse=True)[:testlimit]):
+        if prec == prec_goal:
+            found_rank = min(found_rank, r + 1)
+    if found_rank == 9999:
+        print('## not found ##')
+        print(datasub_val['rxn_smiles'][ix])
+        print(prec_goal)
+
+    return found_rank
 
 
 if __name__ == '__main__':
@@ -81,10 +142,10 @@ if __name__ == '__main__':
                     return DataStructs.BulkTverskySimilarity(x, y, 1.0, 1.5)
             else:
                 raise ValueError('Unknown similarity label')
-
-    	    for dataset in all_dataset:
             
-                for class_ in ['all', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10][::-1]:
+            for dataset in all_dataset:
+            
+                for class_ in ['all'][::-1]:
                     label = '{}_class{}_fp{}_sim{}'.format(
                         dataset,
                         class_,
@@ -95,10 +156,9 @@ if __name__ == '__main__':
                     print(label)
                     print('#'*80)
 
-                    if os.path.isfile(os.path.join(SCRIPT_ROOT, 'out', '{}.txt'.format(label))):
+                    if os.path.isfile(os.path.join(SCRIPT_ROOT, OUT, '{}.txt'.format(label))):
                         print('Have done setting {} already'.format(label))
                         continue
-
 
                     ### Only get new FPs if necessary - is a little slow
                     try:
@@ -128,83 +188,31 @@ if __name__ == '__main__':
                     else:
                         datasub_val = data.loc[data['dataset'] == dataset]
 
-
-                    ### Define function to process one example based on index, ix
-                    def do_one_rdchiral(ix, debug=False):
-                        jx_cache = {}
-                        ex = Chem.MolFromSmiles(datasub_val['prod_smiles'][ix])
-                        rct = rdchiralReactants(datasub_val['prod_smiles'][ix])
-                        fp = datasub_val['prod_fp'][ix]
-                        
-                        sims = similarity_metric(fp, [fp_ for fp_ in datasub['prod_fp']])
-                        js = np.argsort(sims)[::-1]
-
-                        prec_goal = Chem.MolFromSmiles(datasub_val['rxn_smiles'][ix].split('>')[0])
-                        [a.ClearProp('molAtomMapNumber') for a in prec_goal.GetAtoms()]
-                        prec_goal = Chem.MolToSmiles(prec_goal, True)
-                        # Sometimes stereochem takes another canonicalization...
-                        prec_goal = Chem.MolToSmiles(Chem.MolFromSmiles(prec_goal), True)
-                        
-                        # Get probability of precursors
-                        probs = {}
-                        
-                        for j in js[:100]: # limit to 100 for speed
-                            jx = datasub.index[j]
-                            
-                            if jx in jx_cache:
-                                (rxn, template, rcts_ref_fp) = jx_cache[jx]
-                            else:
-                                retro_canonical = process_an_example(datasub['rxn_smiles'][jx], super_general=True)
-                                if retro_canonical is None:
-                                    continue
-                                template = '(' + retro_canonical.replace('>>', ')>>')
-                                rcts_ref_fp = getfp(datasub['rxn_smiles'][jx].split('>')[0])
-                                rxn = rdchiralReaction(template)
-                                jx_cache[jx] = (rxn, template, rcts_ref_fp)
-                            try:
-                                outcomes = rdchiralRun(rxn, rct, combine_enantiomers=False)
-                            except Exception as e:
-                                print(template)
-                                print(datasub_val['rxn_smiles'][ix])
-                                raise(e)
-                                outcomes = []
-                            
-                            for precursors in outcomes:
-                                precursors_fp = getfp(precursors)
-                                precursors_sim = similarity_metric(precursors_fp, [rcts_ref_fp])[0]
-                                if precursors in probs:
-                                    probs[precursors] = max(probs[precursors], precursors_sim * sims[j])
-                                else:
-                                    probs[precursors] = precursors_sim * sims[j]
-                        
-                        testlimit = 50
-                        found_rank = 9999
-                        for r, (prec, prob) in enumerate(sorted(probs.iteritems(), key=lambda x:x[1], reverse=True)[:testlimit]):
-                            if prec == prec_goal:
-                                found_rank = min(found_rank, r + 1)
-                        if found_rank == 9999:
-                            print('## not found ##')
-                            print(datasub_val['rxn_smiles'][ix])
-                            print(prec_goal)
-
-                        return found_rank
-
                     ### Run all validation/testing examples in parallel
                     inputs = list(datasub_val.index)
-                    found_at_rank = Parallel(n_jobs=num_cores, verbose=5)(delayed(do_one_rdchiral)(i) for i in inputs)
-                    
+
+                    pool = multiprocessing.Pool(num_cores)
+                    multi_tasks = [pool.apply_async(do_one_rdchiral, (i, )) for i in inputs]
+                    # found_at_rank = Parallel(n_jobs=num_cores, verbose=5)(delayed(do_nothing)(i) for i in inputs)
+                    found_at_rank = []
+                    for each in tqdm(range(len(multi_tasks))):
+                        try:
+                            result = multi_tasks[each].get()
+                        except:
+                            result = 9999
+                        found_at_rank.append(result)
                     ### Save to individual file
-                    with open(os.path.join(SCRIPT_ROOT, 'out', '{}.txt'.format(label)), 'w') as fid:
+                    with open(os.path.join(SCRIPT_ROOT, OUT, '{}.txt'.format(label)), 'w') as fid:
                         accs = ranks_to_acc(found_at_rank, fid=fid)
 
                     ### Save to global results file
-                    if not os.path.isfile(os.path.join(SCRIPT_ROOT, 'out', 'results.txt')):
-                        with open(os.path.join('out', 'results.txt'), 'w') as fid2:
+                    if not os.path.isfile(os.path.join(SCRIPT_ROOT, OUT, 'results.txt')):
+                        with open(os.path.join(OUT, 'results.txt'), 'w') as fid2:
                             fid2.write('\t'.join(['{:>16}'.format(x) for x in [
                                 'dataset', 'class_', 'n_in_class', 'getfp_label', 'similarity_label',
                                 'top-1 acc', 'top-3 acc', 'top-5 acc', 'top-10 acc',
                                 'top-20 acc', 'top-50 acc']]) + '\n')
-                    with open(os.path.join(SCRIPT_ROOT, 'out', 'results.txt'), 'a') as fid2:
+                    with open(os.path.join(SCRIPT_ROOT, OUT, 'results.txt'), 'a') as fid2:
                         fid2.write('\t'.join(['{:>16}'.format(x) for x in [
                             dataset, class_, len(found_at_rank), getfp_label, similarity_label,
                         ] + accs]) + '\n')
